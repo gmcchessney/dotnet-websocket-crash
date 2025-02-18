@@ -1,146 +1,72 @@
-using System.Net.WebSockets;
-using System.Runtime.ExceptionServices;
+using System.IO.Pipelines;
 using System.Text;
 
 namespace WebSocketClientServer
 {
     public class Program
     {
-        private const int SERVER_PORT = 12345;
-
-        private static readonly AutoResetEvent _clientResetEvent;
-        private static int _consecutiveCancellationCount = 0;
-        private static int _currentCancellationMs = 100;
-        private static int _sendCharCount = 10_000_000;
-
-        static Program()
-        {
-            _clientResetEvent = new AutoResetEvent(initialState: true);
-        }
-
         public static async Task Main(string[] args)
         {
-            SetupUnhandledExceptionHandler();
+            // This is just a stream that has a Thread.Sleep in the overridden Write method.
+            using SlowNullStream myStream = new();
 
-            var builder = WebApplication.CreateBuilder(args);
-            var app = builder.Build();
+            // Concrete type is StreamPipeWriter
+            PipeWriter myPipeWriter = PipeWriter.Create(myStream);
+            var pipeWriterStream = myPipeWriter.AsStream();
+            var bytes = Encoding.UTF8.GetBytes("Hello, World!");
 
-            app.UseWebSockets();
+            CancellationTokenSource myCts = new(TimeSpan.FromSeconds(1));
 
-            app.Use(async (context, next) =>
-            {
-                if (context.WebSockets.IsWebSocketRequest)
-                {
-                    Console.WriteLine($"CURRENT CANCELLATION MS: {_currentCancellationMs}");
+            // This write will take at least ten seconds because of SlowNullStream
+            var writeTask = pipeWriterStream.WriteAsync(bytes, myCts.Token);
 
-                    var webSocket = await context.WebSockets.AcceptWebSocketAsync();
-                    RunServer(webSocket);
-
-                    // Wait a bit so that the web socket send is in
-                    // progress when dispose is called.
-                    await Task.Delay(50);
-
-                    webSocket.Dispose();
-                    _clientResetEvent.Set();
-                }
-                else
-                {
-                    await next();
-                }
-            });
-
-            var runAsyncTask = app.RunAsync();
-
-            // Give the server some time to start.
-            await Task.Delay(1_000);
-
-            var runClientTask = RunClientAsync();
-
-            await Task.WhenAny(runAsyncTask, runClientTask);
-        }
-
-        private static async Task RunClientAsync()
-        {
-            while (true)
-            {
-                _clientResetEvent.WaitOne();
-
-                try
-                {
-                    using ClientWebSocket webSocket = new();
-                    Uri serverUri = new($"wss://localhost:{SERVER_PORT}");
-
-                    await webSocket.ConnectAsync(serverUri, CancellationToken.None);
-
-                    while (true)
-                    {
-                        WebSocketReceiveResult receiveResult = await webSocket.ReceiveAsync(new ArraySegment<byte>(new byte[1024]), CancellationToken.None);
-
-                        if (receiveResult.MessageType == WebSocketMessageType.Close)
-                            break;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"CLIENT: {ex.Message}");
-                }
-            }
-        }
-
-        private static void RunServer(WebSocket webSocket)
-        {
-            string message = new('A', _sendCharCount += 100_000);
-            byte[] messageBytes = Encoding.UTF8.GetBytes(message);
+            // Dispose while a write is in progress, and before the cancellation
+            // token is canceled. The application will crash when the
+            // CancellationTokenSource is canceled by its cancellation timer.
+            pipeWriterStream.Dispose();
 
             try
             {
-                _ = Task.Run(async () =>
-                {
-                    CancellationTokenSource cts = new(Math.Max(_currentCancellationMs, 0));
-
-                    try
-                    {
-                        await webSocket.SendAsync(
-                            messageBytes,
-                            WebSocketMessageType.Text,
-                            endOfMessage: true,
-                            cts.Token);
-
-                        _currentCancellationMs--;
-                        _consecutiveCancellationCount = 0;
-                    }
-                    catch (Exception ex)
-                    {
-                        if (ex is OperationCanceledException)
-                        {
-                            _consecutiveCancellationCount++;
-                            _currentCancellationMs += _consecutiveCancellationCount / 2;
-                        }
-                        else
-                        {
-                            _currentCancellationMs--;
-                            _consecutiveCancellationCount = 0;
-                        }
-                    }
-                });
+                await writeTask;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"SERVER: {ex.Message}");
+                Console.WriteLine($"This exception won't be thrown because we've crashed: {ex}");
             }
+
+            Console.WriteLine("This won't happen because we've crashed!");
         }
 
-        private static void SetupUnhandledExceptionHandler()
+        public class SlowNullStream : Stream
         {
-            AppDomain.CurrentDomain.UnhandledException += UnhandledExceptionHandler;
+            public override bool CanRead => false;
+            public override bool CanSeek => false;
+            public override bool CanWrite => true;
+            public override long Length => 0;
 
-            static void UnhandledExceptionHandler(object sender, UnhandledExceptionEventArgs args)
+            public override long Position
             {
-                Exception ex = (Exception)args.ExceptionObject;
-                Console.WriteLine($"Unhandled exception occurred {ex}");
+                get => 0;
+                set => throw new NotSupportedException();
+            }
 
-                ExceptionDispatchInfo.Capture(ex);
-                ExceptionDispatchInfo.Throw(ex);
+            public override void Flush()
+                => throw new NotSupportedException();
+
+            public override int Read(byte[] buffer, int offset, int count)
+                => throw new NotSupportedException();
+
+            public override long Seek(long offset, SeekOrigin origin)
+                => throw new NotSupportedException();
+
+            public override void SetLength(long value)
+                => throw new NotSupportedException();
+
+            public override void Write(byte[] buffer, int offset, int count)
+            {
+                // Just make this really slow so that the code is in the
+                // right place for a long time.
+                Thread.Sleep(10_000);
             }
         }
     }
